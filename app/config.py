@@ -7,7 +7,8 @@ class Settings(BaseSettings):
     # For development: "sqlite:///./web3_lms.db"
     
     # LLM
-    ANTHROPIC_API_KEY: str   
+    ANTHROPIC_API_KEY: str
+    GEMINI_API_KEY: str
     # App
     ENVIRONMENT: str = "development"
     
