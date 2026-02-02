@@ -4,33 +4,61 @@ from datetime import datetime
 
 # ==================== STUDENT AGENT ====================
 
-class StudentChatRequest(BaseModel):
-    wallet_address: str = Field(..., min_length=42, max_length=42, description="Ethereum wallet address")
-    message: str = Field(..., min_length=1, max_length=2000)
+
+class LearningContext(BaseModel):
     current_course_id: Optional[int] = None
-    
+    current_chapter: Optional[int] = None
+    current_chapter_title: Optional[str] = None
+    current_chapter_summary: Optional[str] = None
+    # Use default_factory to avoid shared mutable default
+    completed_courses: List[Dict] = Field(default_factory=list)
+
+
+class StudentChatRequest(BaseModel):
+    wallet_address: str = Field(
+        ...,
+        min_length=42,
+        max_length=42,
+        description="Ethereum wallet address",
+    )
+    message: str = Field(..., min_length=1, max_length=2000)
+    # Optional top-level course id for convenience/backwards-compat
+    current_course_id: Optional[int] = None
+    # Frontend-supplied learning context snapshot
+    learning_context: Optional[LearningContext] = None
+
     class Config:
         json_schema_extra = {
             "example": {
                 "wallet_address": "0x1234567890123456789012345678901234567890",
                 "message": "Help me understand smart contract security",
-                "current_course_id": 5
+                "current_course_id": 5,
+                "learning_context": {
+                    "current_course_id": 5,
+                    "current_chapter": 2,
+                    "current_chapter_title": "Smart contract security basics",
+                    "current_chapter_summary": "Overview of key vulnerabilities and best practices.",
+                    "completed_courses": [
+                        {"course_id": 1, "title": "Intro to Web3"}
+                    ],
+                },
             }
         }
+
 
 class StudentChatResponse(BaseModel):
     response: str
     mode: str  # 'career', 'learning', 'progress', 'recommendation', 'general'
     profile_updated: bool
     recommendations: Optional[List[Dict]] = None  # If mode='recommendation'
-    
+
     class Config:
         json_schema_extra = {
             "example": {
                 "response": "Smart contract security is crucial! Let me explain the key concepts...",
                 "mode": "learning",
                 "profile_updated": True,
-                "recommendations": None
+                "recommendations": None,
             }
         }
 
