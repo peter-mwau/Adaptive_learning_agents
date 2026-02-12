@@ -74,23 +74,14 @@ async def career_onboarding(
 
     # Execute agent workflow
     result = agent.invoke(initial_state)
-
-    # Extract recommendations from response (they're embedded in the welcome message)
-    # For a more structured response, you could parse the LLM output or store separately
-    recommendations = {
-        "learningPath": "Beginner → Intermediate → Advanced",
-        "recommendedCourses": ["Blockchain Fundamentals", "Smart Contract Development"],
-        "skillPriorities": ["Solidity", "Web3 Architecture"],
-        "timeline": form_data.careerTimeline,
-    }
+    onboarding_results = result.get("onboarding_results", {})
+    print("Onboarding Results:", onboarding_results)
 
     return CareerOnboardingResponse(
-        success=True,
-        profileId=form_data.walletAddress,
-        recommendations=recommendations,
-        message=result.get(
-            "response", "Welcome! Your career profile has been created."
-        ),
+        careerProfile=onboarding_results.get("careerProfile"),
+        courseMatchAnalysis=onboarding_results.get("courseMatchAnalysis"),
+        suggestedCourses=onboarding_results.get("suggestedCourses"),
+        additionalNotes=onboarding_results.get("additionalNotes", ""),
     )
 
 
@@ -131,6 +122,58 @@ async def student_chat(payload: StudentChatRequest, db: Session = Depends(get_db
         mode=result["mode"],
         profile_updated=bool(result.get("profile_updates")),
         recommendations=None,  # Can be populated if needed
+    )
+
+
+@app.post("/api/student/learning-mode", response_model=StudentChatResponse)
+async def student_learning_mode(
+    payload: StudentChatRequest, db: Session = Depends(get_db)
+):
+    """
+    Dedicated endpoint for learning assistance.
+    Used when student is actively in a course and needs help with content.
+
+    Requires:
+    - current_course_id or learning_context with course details
+    - current_chapter_title and current_chapter_summary (recommended)
+    """
+    if not payload.current_course_id and not (
+        payload.learning_context and payload.learning_context.current_course_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="current_course_id is required for learning assistance",
+        )
+
+    agent = StudentCompanionAgent(db)
+    lc = payload.learning_context
+
+    # Prepare initial state with learning context
+    initial_state = {
+        "wallet_address": payload.wallet_address,
+        "last_message": payload.message,
+        "onboarding_data": None,
+        "user_profile": {},
+        "conversation_history": [],
+        "conversation_summary": "",
+        "completed_courses": lc.completed_courses if lc else [],
+        "current_course_id": lc.current_course_id if lc else payload.current_course_id,
+        "current_chapter": lc.current_chapter if lc else None,
+        "current_chapter_title": lc.current_chapter_title if lc else None,
+        "current_chapter_summary": lc.current_chapter_summary if lc else None,
+        "mode": "learning",  # Force learning mode
+        "response": "",
+        "profile_updates": {},
+    }
+
+    # Execute agent
+    result = agent.invoke(initial_state)
+
+    return StudentChatResponse(
+        response=result["response"],
+        mode=result["mode"],
+        profile_updated=bool(result.get("profile_updates")),
+        recommendations=None,
     )
 
 
