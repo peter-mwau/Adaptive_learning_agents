@@ -1,17 +1,20 @@
-from typing import TypedDict, Annotated
-from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
-# from langchain_anthropic import ChatAnthropic
-import operator
 import json
 
-from app.database import (
-    get_user_profile,
-    update_user_profile,
-    save_conversation,
-    get_conversation_history,
-)
+# from langchain_anthropic import ChatAnthropic
+import operator
+import re
+from typing import Annotated, TypedDict
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, StateGraph
+
 from app.config import settings
+from app.database import (
+    get_conversation_history,
+    get_user_profile,
+    save_conversation,
+    update_user_profile,
+)
 
 
 class StudentState(TypedDict):
@@ -31,9 +34,10 @@ class StudentState(TypedDict):
     # Current interaction
     last_message: str
     mode: str  # 'career', 'learning', 'progress', 'recommendation', 'general', 'onboarding'
-    
+
     # Onboarding form data (if present)
     onboarding_data: dict | None
+    onboarding_results: dict | None
 
     # Response data
     response: str
@@ -46,9 +50,25 @@ class StudentCompanionAgent:
     def __init__(self, db_session):
         self.db = db_session
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash", api_key=settings.GEMINI_API_KEY
+            model="gemini-3-flash-preview", api_key=settings.GEMINI_API_KEY
         )
         self.graph = self.build_graph()
+
+    def _extract_text_from_response(self, response) -> str:
+        """Extract plain text from LLM response."""
+        if isinstance(response.content, str):
+            return response.content
+        elif isinstance(response.content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for block in response.content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            return "\n".join(text_parts)
+        else:
+            return str(response.content)
 
     def build_graph(self):
         """Build and compile the student companion workflow graph."""
@@ -99,6 +119,24 @@ class StudentCompanionAgent:
 
         return workflow.compile()
 
+    def _safe_extract_json(self, text: str) -> dict:
+        """
+        Extracts JSON from a string that might contain conversational filler
+         or markdown code blocks.
+        """
+        try:
+            # 1. Try to find anything between the first { and the last }
+            match = re.search(r"(\{.*\})", text, re.DOTALL)
+            if match:
+                clean_json = match.group(1)
+                return json.loads(clean_json)
+
+            # 2. If no brackets, try a direct load
+            return json.loads(text.strip())
+        except Exception as e:
+            print(f"JSON Extraction Error: {e} | Raw Text: {text[:100]}...")
+            return None
+
     def load_context(self, state: StudentState) -> StudentState:
         """
         Load user context from the agent database (profile and recent history).
@@ -114,6 +152,7 @@ class StudentCompanionAgent:
         # Ensure wallet_address is stored (create profile if doesn't exist)
         if not profile:
             from app.database import create_user_profile
+
             create_user_profile(self.db, wallet)
             profile = get_user_profile(self.db, wallet) or {}
 
@@ -124,16 +163,16 @@ class StudentCompanionAgent:
             "conversation_summary": state.get("conversation_summary", ""),
             "profile_updates": {},
         }
-            
+
     def determine_mode(self, state: StudentState) -> StudentState:
         """Decide what mode to operate in."""
 
         message = state["last_message"].lower()
-        
+
         # Check if this is an onboarding form submission
         if state.get("onboarding_data"):
             mode = "onboarding"
-        
+
         # Career onboarding for new users (conversational)
         elif not state.get("completed_courses") and not state["user_profile"].get(
             "career_context"
@@ -168,7 +207,7 @@ class StudentCompanionAgent:
             mode = "general"
 
         return {**state, "mode": mode}
-    
+
     def summarize_conversation_if_needed(self, state: StudentState) -> StudentState:
         """
         Summarize conversation history if it gets too long (memory management).
@@ -176,15 +215,15 @@ class StudentCompanionAgent:
         """
         history = state.get("conversation_history", [])
         summary = state.get("conversation_summary", "")
-        
+
         # If we have more than 15 messages, summarize the older ones
         if len(history) > 15:
             # Keep last 5 messages, summarize the rest
             recent = history[-5:]
             to_summarize = history[:-5]
-            
+
             if to_summarize:
-                summary_prompt = f"""Summarize this conversation history into a concise summary 
+                summary_prompt = f"""Summarize this conversation history into a concise summary
 that captures key information about the user's goals, progress, and preferences:
 
 Previous summary: {summary if summary else "None"}
@@ -197,126 +236,111 @@ Return a brief summary (2-3 sentences) that preserves:
 - Learning progress and completed courses
 - Key preferences and challenges
 - Important context for future conversations"""
-                
-                summary_response = self.llm.invoke([{"role": "user", "content": summary_prompt}])
-                new_summary = summary_response.content
-                
+
+                summary_response = self.llm.invoke(
+                    [{"role": "user", "content": summary_prompt}]
+                )
+                new_summary = self._extract_text_from_response(summary_response)
                 return {
                     **state,
                     "conversation_history": recent,
                     "conversation_summary": new_summary,
                 }
-        
+
         return state
-    
+
     def handle_onboarding(self, state: StudentState) -> StudentState:
         """
-        Handle career onboarding form submission.
-        Processes structured form data and creates initial career profile.
+        Handle career onboarding by generating a structured profile and
+        course match analysis matching the CareerOnboardingResponse schema.
         """
         onboarding_data = state.get("onboarding_data")
         if not onboarding_data:
-            # Fallback to conversational onboarding if no form data
             return self.career_guidance(state)
-        
-        wallet = state["wallet_address"]
-        
-        # Transform form data into structured career context
-        career_context = {
-            "current_status": onboarding_data.get("currentStatus"),
-            "current_role": onboarding_data.get("currentRole"),
-            "years_of_experience": onboarding_data.get("yearsOfExperience"),
-            "industry_background": onboarding_data.get("industryBackground"),
-            "technical_level": onboarding_data.get("technicalLevel"),
-            "programming_languages": onboarding_data.get("programmingLanguages", []),
-            "blockchain_experience": onboarding_data.get("hasBlockchainExp"),
-            "ai_experience": onboarding_data.get("hasAIExp"),
-            "target_role": onboarding_data.get("targetRole", []),
-            "career_timeline": onboarding_data.get("careerTimeline"),
-            "geographic_preference": onboarding_data.get("geographicPreference"),
-            "primary_motivation": onboarding_data.get("primaryMotivation", []),
-            "web3_interest": onboarding_data.get("webThreeInterest"),
-            "ai_interest": onboarding_data.get("aiInterest"),
-            "onboarding_completed_at": onboarding_data.get("submittedAt"),
-        }
-        
-        learning_preferences = {
-            "learning_style": onboarding_data.get("learningStyle"),
-            "time_commitment": onboarding_data.get("timeCommitment"),
-            "short_term_goal": onboarding_data.get("shortTermGoal"),
-            "concerns": onboarding_data.get("concerns"),
-        }
-        
-        skill_profile = {
-            "strong_skills": onboarding_data.get("strongSkills", []),
-            "want_to_improve": onboarding_data.get("wantToImprove", []),
-        }
-        
-        # Generate personalized recommendations using LLM
-        profile_summary = f"""New user onboarding:
-- Status: {career_context['current_status']}
-- Experience: {career_context.get('years_of_experience', 'N/A')} years, {career_context['technical_level']} level
-- Skills: {', '.join(career_context.get('programming_languages', []))}
-- Blockchain: {career_context['blockchain_experience']}, AI: {career_context['ai_experience']}
-- Goals: {', '.join(career_context['target_role'])} within {career_context['career_timeline']} months
-- Learning: {learning_preferences['learning_style']}, {learning_preferences['time_commitment']} hrs/week
-- Short-term: {learning_preferences['short_term_goal']}
-- Interests: Web3={career_context.get('web3_interest', 'general')}, AI={career_context.get('ai_interest', 'general')}"""
-        
-        recommendation_prompt = f"""You are a career advisor for a Web3/AI learning platform.
 
-{profile_summary}
+        # 1. Prepare data for the prompt
+        all_courses = onboarding_data.get("allCourses", [])
+        selected_course = onboarding_data.get("selectedCourse") or {}
 
-Generate personalized recommendations:
-1. A learning path (e.g., "Beginner → Intermediate → Advanced")
-2. Top 3-5 recommended course topics/modules they should start with
-3. Key skill priorities to focus on
-4. Timeline alignment with their {career_context['career_timeline']}-month goal
-
-Return as JSON:
-{{
-    "learningPath": "string",
-    "recommendedCourses": ["course1", "course2", ...],
-    "skillPriorities": ["skill1", "skill2", ...],
-    "timeline": "{career_context['career_timeline']}",
-    "welcomeMessage": "Personalized welcome message"
-}}"""
-        
-        recommendation_response = self.llm.invoke([{"role": "user", "content": recommendation_prompt}])
-        
-        try:
-            recommendations = json.loads(
-                recommendation_response.content.strip("```json").strip("```")
-            )
-        except Exception:
-            recommendations = {
-                "learningPath": "Beginner → Intermediate → Advanced",
-                "recommendedCourses": ["Blockchain Fundamentals", "Smart Contract Development"],
-                "skillPriorities": ["Solidity", "Web3 Architecture"],
-                "timeline": career_context["career_timeline"],
-                "welcomeMessage": "Welcome! Let's start your Web3 learning journey!",
-            }
-        
-        # Prepare profile updates
-        profile_updates = {
-            "career_context": career_context,
-            "learning_preferences": learning_preferences,
-            "skill_profile": skill_profile,
-        }
-        
-        # Generate welcome response
-        welcome_message = recommendations.get(
-            "welcomeMessage",
-            f"Welcome! I've created your career profile. Your goal is to become a {career_context['target_role'][0] if career_context['target_role'] else 'Web3 professional'}. Let's get started!"
+        # Format the user's background into a digestible string
+        profile_summary = (
+            f"Role: {onboarding_data.get('currentRole')} ({onboarding_data.get('yearsOfExperience')} yrs exp)\n"
+            f"Tech Level: {onboarding_data.get('technicalLevel')}\n"
+            f"Languages: {', '.join(onboarding_data.get('programmingLanguages', []))}\n"
+            f"Target Roles: {', '.join(onboarding_data.get('targetRole', []))}\n"
+            f"Timeline: {onboarding_data.get('careerTimeline')} months"
         )
-        
+
+        # 2. Build the STRICT prompt
+        # We use a System message to force JSON mode in Gemini
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a Career Data Engine. You output ONLY valid JSON. No conversational text, no greetings, no markdown backticks.",
+            },
+            {
+                "role": "user",
+                "content": f"""
+                    Analyze this profile and return a JSON object.
+
+                    USER PROFILE:
+                    {profile_summary}
+
+                    SELECTED COURSE:
+                    {json.dumps(selected_course)}
+
+                    AVAILABLE COURSES:
+                    {json.dumps(all_courses)}
+
+                    REQUIRED JSON FORMAT:
+                    {{
+                        "careerProfile": "Professional summary string",
+                        "courseMatchAnalysis": "Explanation of fit string",
+                        "suggestedCourses": [{{"courseId": "str", "courseName": "str", "reason": "str"}}],
+                        "additionalNotes": "Advice string"
+                    }}
+                """,
+            },
+        ]
+
+        # 3. Invoke LLM and Parse
+        response = self.llm.invoke(messages)
+        raw_text = self._extract_text_from_response(response)
+
+        # Use your existing _safe_extract_json helper
+        recommendations = self._safe_extract_json(raw_text)
+
+        # 4. Fallback Logic: Ensure NO NULLS reach the Pydantic model
+        if not recommendations:
+            recommendations = {
+                "careerProfile": "Analysis pending profile review.",
+                "courseMatchAnalysis": "The selected course aligns with standard industry paths.",
+                "suggestedCourses": [],
+                "additionalNotes": "Complete the first module to unlock personalized insights.",
+            }
+        else:
+            # Final sanity check: Replace any individual nulls with empty strings/lists
+            recommendations["careerProfile"] = (
+                recommendations.get("careerProfile") or "Summary unavailable."
+            )
+            recommendations["courseMatchAnalysis"] = (
+                recommendations.get("courseMatchAnalysis") or "Analysis unavailable."
+            )
+            recommendations["suggestedCourses"] = (
+                recommendations.get("suggestedCourses") or []
+            )
+            recommendations["additionalNotes"] = (
+                recommendations.get("additionalNotes") or ""
+            )
+
+        # 5. Return updated state
         return {
             **state,
-            "response": welcome_message,
-            "profile_updates": profile_updates,
+            "onboarding_results": recommendations,
+            "response": recommendations["careerProfile"],
             "mode": "onboarding",
         }
-    
+
     def career_guidance(self, state: StudentState) -> StudentState:
         """
         Provide ongoing career guidance to the student (conversational, not form-based).
@@ -325,13 +349,13 @@ Return as JSON:
         profile = state["user_profile"]
         completed = state["completed_courses"] or []
         summary = state.get("conversation_summary", "")
-        
+
         # Build context from profile
         career_ctx = profile.get("career_context", {})
         target_roles = career_ctx.get("target_role", [])
         timeline = career_ctx.get("career_timeline", "flexible")
         current_status = career_ctx.get("current_status", "unknown")
-        
+
         # Build conversation context
         context_parts = []
         if summary:
@@ -341,9 +365,13 @@ Return as JSON:
         if timeline:
             context_parts.append(f"Timeline: {timeline} months")
         if completed:
-            context_parts.append(f"Completed courses: {', '.join([c.get('title', 'Unknown') for c in completed])}")
-        
-        context_str = "\n".join(context_parts) if context_parts else "New user, no prior context."
+            context_parts.append(
+                f"Completed courses: {', '.join([c.get('title', 'Unknown') for c in completed])}"
+            )
+
+        context_str = (
+            "\n".join(context_parts) if context_parts else "New user, no prior context."
+        )
 
         system_prompt = f"""You are a career guidance AI for a Web3/AI learning platform.
 
@@ -353,7 +381,7 @@ User Context:
 Current status: {current_status}
 
 Your role:
-- Provide personalized career advice aligned with their goals: {', '.join(target_roles) if target_roles else 'to be discovered'}
+- Provide personalized career advice aligned with their goals: {", ".join(target_roles) if target_roles else "to be discovered"}
 - Recommend specific learning tracks and courses on the platform
 - Help them understand job market trends and requirements
 - Guide them toward their {timeline}-month career timeline
@@ -361,10 +389,10 @@ Your role:
 
 If they ask about courses or tracks, recommend specific ones that align with their goals.
 Be conversational and supportive."""
-        
+
         # Build message history with summary
         messages = [{"role": "system", "content": system_prompt}]
-        
+
         # Add conversation history (already trimmed by summarization if needed)
         messages.extend(state["conversation_history"])
         messages.append({"role": "user", "content": state["last_message"]})
@@ -376,7 +404,7 @@ Be conversational and supportive."""
         extraction_prompt = f"""From this conversation, extract any NEW career-related information as JSON.
 Only return data if the user provided NEW information not already in their profile.
 
-User message: {state['last_message']}
+User message: {state["last_message"]}
 Your response: {response.content}
 
 Return ONLY valid JSON (or empty object {{}} if no new info):
@@ -400,14 +428,14 @@ Return ONLY valid JSON (or empty object {{}} if no new info):
         if new_career_data and any(new_career_data.values()):
             existing_career = profile.get("career_context", {})
             updated_career = {**existing_career}
-            
+
             if new_career_data.get("target_role"):
                 updated_career["target_role"] = new_career_data["target_role"]
             if new_career_data.get("timeline"):
                 updated_career["career_timeline"] = new_career_data["timeline"]
             if new_career_data.get("motivation"):
                 updated_career["primary_motivation"] = new_career_data["motivation"]
-            
+
             profile_updates["career_context"] = updated_career
 
         return {
@@ -423,7 +451,7 @@ Return ONLY valid JSON (or empty object {{}} if no new info):
         chapter_summary = state.get("current_chapter_summary")
         summary = state.get("conversation_summary", "")
         profile = state["user_profile"]
-        
+
         # Get user's career context for personalized help
         career_ctx = profile.get("career_context", {})
         target_role = career_ctx.get("target_role", [])
@@ -435,9 +463,9 @@ Current Chapter: {chapter_title or "Unknown"}
 Chapter content summary:
 {chapter_summary or "No summary available"}
 
-User's skill level: {profile.get('career_context', {}).get('technical_level', 'Unknown')}{target_str}
+User's skill level: {profile.get("career_context", {}).get("technical_level", "Unknown")}{target_str}
 
-{f'Previous conversation context: {summary}' if summary else ''}
+{f"Previous conversation context: {summary}" if summary else ""}
 
 Your role:
 - Answer questions about the current chapter
@@ -454,6 +482,7 @@ Be patient and adaptive to their level."""
         messages.append({"role": "user", "content": state["last_message"]})
 
         response = self.llm.invoke(messages)
+        response_text = self._extract_text_from_response(response)
 
         # Track learning challenges based on difficulty signals
         if any(
@@ -469,8 +498,12 @@ Be patient and adaptive to their level."""
         else:
             profile_updates = {}
 
-        return {**state, "response": response.content, "profile_updates": profile_updates}
-    
+        return {
+            **state,
+            "response": response_text,
+            "profile_updates": profile_updates,
+        }
+
     def progress_review(self, state: StudentState) -> StudentState:
         """Show user their learning progress."""
 
@@ -494,7 +527,7 @@ Currently learning: {current_course_label}
 
 {progress_summary}
 
-Career goal: {state['user_profile'].get('career_context', {}).get('target_role', 'Not set')}
+Career goal: {state["user_profile"].get("career_context", {}).get("target_role", "Not set")}
 
 Provide:
 - Celebration of achievements
@@ -508,8 +541,9 @@ Provide:
         ]
 
         response = self.llm.invoke(messages)
+        response_text = self._extract_text_from_response(response)
 
-        return {**state, "response": response.content}
+        return {**state, "response": response_text}
 
     def course_recommendation(self, state: StudentState) -> StudentState:
         """Recommend next courses based on goals and progress.
@@ -518,8 +552,10 @@ Provide:
         general knowledge and the completed courses context.
         """
 
-        career_goal = state["user_profile"].get("career_context", {}).get(
-            "target_role", "Web3 developer"
+        career_goal = (
+            state["user_profile"]
+            .get("career_context", {})
+            .get("target_role", "Web3 developer")
         )
 
         completed_titles = [
@@ -542,15 +578,16 @@ course catalog; focus on topics and learning objectives."""
         ]
 
         response = self.llm.invoke(messages)
+        response_text = self._extract_text_from_response(response)
 
-        return {**state, "response": response.content}
-    
+        return {**state, "response": response_text}
+
     def general_conversation(self, state: StudentState) -> StudentState:
         """General helpful conversation."""
 
         system_prompt = f"""You are a friendly learning companion for a Web3 education platform.
 
-User's goal: {state['user_profile'].get('career_context', {}).get('target_role', 'learning Web3')}
+User's goal: {state["user_profile"].get("career_context", {}).get("target_role", "learning Web3")}
 
 Be helpful, encouraging, and guide them toward their learning goals."""
 
@@ -561,8 +598,9 @@ Be helpful, encouraging, and guide them toward their learning goals."""
         ]
 
         response = self.llm.invoke(messages)
+        response_text = self._extract_text_from_response(response)
 
-        return {**state, "response": response.content}
+        return {**state, "response": response_text}
 
     def update_user_profile_node(self, state: StudentState) -> StudentState:
         """Save any profile updates to DB and log the conversation."""
