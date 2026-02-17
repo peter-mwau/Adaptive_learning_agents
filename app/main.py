@@ -137,13 +137,12 @@ async def student_learning_mode(
     - current_course_id or learning_context with course details
     - current_chapter_title and current_chapter_summary (recommended)
     """
-    if not payload.current_course_id and not (
-        payload.learning_context and payload.learning_context.current_course_id
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="current_course_id is required for learning assistance",
-        )
+    print("Payload:", payload)
+    # if payload.current_course_id is not None:
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail="current_course_id is required for learning assistance",
+    #     )
 
     agent = StudentCompanionAgent(db)
     lc = payload.learning_context

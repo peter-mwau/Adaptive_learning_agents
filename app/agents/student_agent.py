@@ -294,7 +294,7 @@ Return a brief summary (2-3 sentences) that preserves:
 
                     REQUIRED JSON FORMAT:
                     {{
-                        "careerProfile": "Professional summary string",
+                        "careerProfile": "Professional summary 3-4 sentences",
                         "courseMatchAnalysis": "Explanation of fit string",
                         "suggestedCourses": [{{"courseId": "str", "courseName": "str", "reason": "str"}}],
                         "additionalNotes": "Advice string"

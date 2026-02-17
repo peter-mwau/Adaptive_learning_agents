@@ -51,13 +51,13 @@ This project implements a multi-agent system leveraging **LangChain** and **LLMs
    ```
 
 2. **Install dependencies**
-   ```
+   ```bash
    For Macos/Linux:
    curl -LsSf https://astral.sh/uv/install.sh | sh
+   
    For Windows:
    powershell -c "irm https://astral.sh/uv/install.ps1 | more"
-   ``` 
-   ```bash
+
    uv sync
    ```
 
