@@ -50,7 +50,8 @@ class StudentCompanionAgent:
     def __init__(self, db_session):
         self.db = db_session
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview", api_key=settings.GEMINI_API_KEY
+            #gemini-3-flash-preview
+            model="gemini-2.5-flash-lite", api_key=settings.GEMINI_API_KEY
         )
         self.graph = self.build_graph()
 
@@ -398,6 +399,7 @@ Be conversational and supportive."""
         messages.append({"role": "user", "content": state["last_message"]})
 
         response = self.llm.invoke(messages)
+        response_text = self._extract_text_from_response(response)
 
         # Extract any new career insights from conversation (optional update)
         # Only extract if significant new information is mentioned
@@ -440,7 +442,7 @@ Return ONLY valid JSON (or empty object {{}} if no new info):
 
         return {
             **state,
-            "response": response.content,
+            "response": response_text,
             "profile_updates": profile_updates,
         }
 
