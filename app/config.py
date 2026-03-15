@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic_settings import SettingsConfigDict
 from pydantic_settings import BaseSettings
 
 
@@ -15,11 +16,13 @@ class Settings(BaseSettings):
     # App
     ENVIRONMENT: str = "development"
     DEV_LENIENT_GRADING: bool = True
-    
+    SECRET_KEY: str = "dev-secret-key"
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="ignore",
+    )
 
 
 @lru_cache()
